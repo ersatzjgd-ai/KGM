@@ -6,29 +6,36 @@ import tempfile
 from fpdf import FPDF
 from taipy.gui import Gui, notify, download
 import taipy.gui.builder as tgb
-
-# Use the native python supabase client for Taipy
 from supabase import create_client, Client
 
 # ==========================================
-# 1. ACTUAL SUPABASE INITIALIZATION
+# 1. ACTUAL SUPABASE INITIALIZATION & VALIDATION
 # ==========================================
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+db_status_ui = "🔄 Checking Connection..."
+supabase = None
 
-# Safety wrapper to prevent immediate app crashes if env vars are delayed
 if not SUPABASE_URL or not SUPABASE_KEY:
     print("⚠️ Missing SUPABASE_URL or SUPABASE_KEY in Railway Environment Variables!")
-    supabase = None
+    db_status_ui = "🔴 Missing Railway Variables"
 else:
     try:
         supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        print("✅ Supabase connection initialized successfully.")
+        # Active validation: Ping the table to ensure the schema exists
+        supabase.table("guests").select("id").limit(1).execute()
+        print("✅ Supabase connection and schema validated successfully.")
+        db_status_ui = "🟢 Live Database Connected"
     except Exception as e:
-        print(f"⚠️ Failed to initialize Supabase: {e}")
+        error_msg = str(e).lower()
+        if "relation" in error_msg or "not found" in error_msg:
+            print("⚠️ Database connected, but 'guests' table is missing.")
+            db_status_ui = "⚠️ DB Connected, but 'guests' table is missing!"
+        else:
+            print(f"⚠️ Failed to initialize Supabase: {e}")
+            db_status_ui = "🔴 Database Offline"
         supabase = None
 
-# Today's date boundary filter for performance optimization
 today_start = f"{datetime.now().strftime('%Y-%m-%d')}T00:00:00"
 
 # ==========================================
@@ -56,9 +63,25 @@ search_active = ""
 # ==========================================
 # 3. CORE LOGIC / REFRESH FUNCTIONS
 # ==========================================
+def refresh_connection(state):
+    """Allows manual retry of database connection without rebooting the server."""
+    notify(state, "info", "Checking database connection...")
+    global supabase
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            temp_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+            temp_client.table("guests").select("id").limit(1).execute()
+            supabase = temp_client
+            state.db_status_ui = "🟢 Live Database Connected"
+            notify(state, "success", "Database reconnected successfully!")
+            refresh_data(state)
+        except Exception as e:
+            state.db_status_ui = "🔴 Database Offline or Schema Missing"
+            notify(state, "error", "Could not verify database connection or schema.")
+
 def refresh_data(state):
     if not supabase: 
-        notify(state, "error", "Database disconnected. Check Railway variables.")
+        notify(state, "error", "Database disconnected. Check status indicator.")
         return
     
     try:
@@ -73,6 +96,7 @@ def refresh_data(state):
         state.active_guests = res_act.data
     except Exception as e:
         print(f"Database fetch error: {e}")
+        notify(state, "error", "Failed to fetch data from database.")
 
 def filter_incoming_guests(state):
     search = state.search_incoming.lower()
@@ -99,45 +123,66 @@ def logout_action(state):
     notify(state, "info", "Logged out.")
 
 def save_new_guests(state):
-    if not supabase: return
+    if not supabase:
+        notify(state, "error", "Cannot save: Database is disconnected.")
+        return
+    
     if state.guest_names_input.strip():
         names_list = [name.strip() for name in state.guest_names_input.split('\n') if name.strip()]
         insert_data = [{"guest_name": name, "session_type": state.session_type} for name in names_list]
-        supabase.table("guests").insert(insert_data).execute()
-        notify(state, "success", f"Added {len(names_list)} guests!")
-        state.guest_names_input = ""
-        refresh_data(state)
+        try:
+            supabase.table("guests").insert(insert_data).execute()
+            notify(state, "success", f"Added {len(names_list)} guests!")
+            state.guest_names_input = ""
+            refresh_data(state)
+        except Exception as e:
+            notify(state, "error", f"Failed to save guests: Check schema.")
+            print(f"Insert error: {e}")
     else:
         notify(state, "error", "Please enter at least one guest name.")
 
 def generate_pdf_report(state):
-    if not supabase: return
-    res = supabase.table("guests").select("*").gte("created_at", today_start).order("created_at").execute()
-    guests_data = res.data
+    if not supabase:
+        notify(state, "error", "Cannot generate report: Database is disconnected.")
+        return
     
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Arial", 'B', 16)
-    pdf.cell(0, 10, txt=f"Kaveri GM - Session Report ({datetime.now().strftime('%Y-%m-%d')})", ln=True, align='C')
-    pdf.ln(5)
-    
-    for g in guests_data:
-        pdf.set_font("Arial", 'B', 12)
-        pdf.cell(0, 8, txt=f"Guest: {g['guest_name']} ({g.get('session_type', 'N/A')})", ln=True)
-        pdf.set_font("Arial", '', 10)
-        pdf.cell(0, 6, txt=f"Lounge: {g.get('lounge', 'Unassigned')} | LMW: {g.get('lmw_status', 'Not yet')}", ln=True)
-        pdf.ln(2)
+    try:
+        res = supabase.table("guests").select("*").gte("created_at", today_start).order("created_at").execute()
+        guests_data = res.data
         
-    pdf_file_path = os.path.join(tempfile.gettempdir(), f"Kaveri_Report_{datetime.now().strftime('%Y%m%d')}.pdf")
-    pdf.output(pdf_file_path)
-    download(state, content=pdf_file_path, name=f"Kaveri_Report_{datetime.now().strftime('%Y%m%d')}.pdf")
-    notify(state, "success", "Report downloaded!")
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Arial", 'B', 16)
+        pdf.cell(0, 10, txt=f"Kaveri GM - Session Report ({datetime.now().strftime('%Y-%m-%d')})", ln=True, align='C')
+        pdf.ln(5)
+        
+        for g in guests_data:
+            pdf.set_font("Arial", 'B', 12)
+            pdf.cell(0, 8, txt=f"Guest: {g['guest_name']} ({g.get('session_type', 'N/A')})", ln=True)
+            pdf.set_font("Arial", '', 10)
+            pdf.cell(0, 6, txt=f"Lounge: {g.get('lounge', 'Unassigned')} | LMW: {g.get('lmw_status', 'Not yet')}", ln=True)
+            pdf.ln(2)
+            
+        pdf_file_path = os.path.join(tempfile.gettempdir(), f"Kaveri_Report_{datetime.now().strftime('%Y%m%d')}.pdf")
+        pdf.output(pdf_file_path)
+        download(state, content=pdf_file_path, name=f"Kaveri_Report_{datetime.now().strftime('%Y%m%d')}.pdf")
+        notify(state, "success", "Report downloaded!")
+    except Exception as e:
+        notify(state, "error", "Failed to generate report.")
+        print(f"PDF generation error: {e}")
 
 # ==========================================
 # 5. GUI LAYOUT
 # ==========================================
 with tgb.Page() as main_page:
-    tgb.text("🏛️ Kaveri GM", class_name="h1")
+    # Header & Status Indicator
+    tgb.layout(columns="1 1")
+    with tgb.part():
+        tgb.text("🏛️ Kaveri GM", class_name="h1")
+    with tgb.part():
+        tgb.text("{db_status_ui}", class_name="h4")
+        tgb.button("🔄 Retry Connection", on_action=refresh_connection)
+    
     tgb.selector(value="{role}", lov="{role_options}", dropdown=False)
     tgb.html("hr")
 
@@ -159,7 +204,6 @@ with tgb.Page() as main_page:
             tgb.text("📥 Incoming Guests", class_name="h3")
             tgb.input("{search_incoming}", label="🔍 Search Expected Guest...")
             
-            # Data Table Representation
             tgb.table("{filtered_expected}", filter=True, page_size=10)
             
             tgb.html("hr")
@@ -184,7 +228,6 @@ with tgb.Page() as main_page:
         tgb.selector(value="{selected_lounge_view}", lov="{lounge_options}", dropdown=False)
         tgb.input("{search_active}", label="🔍 Search Active Guest...")
         
-        # Standard table view placeholder for complex cards
         tgb.table("{active_guests}", filter=True, page_size=15)
 
 # ==========================================
