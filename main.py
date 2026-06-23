@@ -11,18 +11,24 @@ import taipy.gui.builder as tgb
 from supabase import create_client, Client
 
 # ==========================================
-# 1. INITIALIZATION & DATABASE
+# 1. ACTUAL SUPABASE INITIALIZATION
 # ==========================================
-# Fetch credentials from Railway environment variables
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "your_supabase_url")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "your_supabase_key")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-try:
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-except Exception as e:
-    print("⚠️ Supabase client not initialized. Ensure env variables are set in Railway.")
+# Safety wrapper to prevent immediate app crashes if env vars are delayed
+if not SUPABASE_URL or not SUPABASE_KEY:
+    print("⚠️ Missing SUPABASE_URL or SUPABASE_KEY in Railway Environment Variables!")
     supabase = None
+else:
+    try:
+        supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print("✅ Supabase connection initialized successfully.")
+    except Exception as e:
+        print(f"⚠️ Failed to initialize Supabase: {e}")
+        supabase = None
 
+# Today's date boundary filter for performance optimization
 today_start = f"{datetime.now().strftime('%Y-%m-%d')}T00:00:00"
 
 # ==========================================
@@ -51,17 +57,22 @@ search_active = ""
 # 3. CORE LOGIC / REFRESH FUNCTIONS
 # ==========================================
 def refresh_data(state):
-    if not supabase: return
+    if not supabase: 
+        notify(state, "error", "Database disconnected. Check Railway variables.")
+        return
     
-    # Manager: Incoming Guests
-    res_inc = supabase.table("guests").select("*").eq("is_active", False).eq("has_left_kaveri", False).gte("created_at", today_start).order("created_at").execute()
-    state.expected_guests = res_inc.data
-    filter_incoming_guests(state)
+    try:
+        # Manager: Incoming Guests
+        res_inc = supabase.table("guests").select("*").eq("is_active", False).eq("has_left_kaveri", False).gte("created_at", today_start).order("created_at").execute()
+        state.expected_guests = res_inc.data
+        filter_incoming_guests(state)
 
-    # Manager & Team: Active Guests
-    res_act = supabase.table("guests").select("*").eq("is_active", True).eq("jai_gurudev", False).gte("created_at", today_start).order("created_at").execute()
-    state.mgr_active_guests = res_act.data
-    state.active_guests = res_act.data
+        # Manager & Team: Active Guests
+        res_act = supabase.table("guests").select("*").eq("is_active", True).eq("jai_gurudev", False).gte("created_at", today_start).order("created_at").execute()
+        state.mgr_active_guests = res_act.data
+        state.active_guests = res_act.data
+    except Exception as e:
+        print(f"Database fetch error: {e}")
 
 def filter_incoming_guests(state):
     search = state.search_incoming.lower()
@@ -85,6 +96,7 @@ def login_action(state):
 def logout_action(state):
     state.manager_logged_in = False
     state.pwd_input = ""
+    notify(state, "info", "Logged out.")
 
 def save_new_guests(state):
     if not supabase: return
@@ -147,7 +159,7 @@ with tgb.Page() as main_page:
             tgb.text("📥 Incoming Guests", class_name="h3")
             tgb.input("{search_incoming}", label="🔍 Search Expected Guest...")
             
-            # Simplified Data Table Representation for Taipy
+            # Data Table Representation
             tgb.table("{filtered_expected}", filter=True, page_size=10)
             
             tgb.html("hr")
@@ -172,25 +184,20 @@ with tgb.Page() as main_page:
         tgb.selector(value="{selected_lounge_view}", lov="{lounge_options}", dropdown=False)
         tgb.input("{search_active}", label="🔍 Search Active Guest...")
         
-        # In a full Taipy build, a customized list iterator (using <|part|loop|>) is used 
-        # to render individual complex cards. Here we provide the standard Taipy table view 
-        # to ensure stable execution on deployment.
+        # Standard table view placeholder for complex cards
         tgb.table("{active_guests}", filter=True, page_size=15)
 
 # ==========================================
 # 6. INITIALIZATION & RAILWAY CONFIG
 # ==========================================
 if __name__ == "__main__":
-    # Fetch the dynamic port provided by Railway, or default to 5000 for local testing
     port = int(os.environ.get("PORT", 5000))
     
-    # Establish your application's base theme color
     custom_stylekit = {
         "color_primary": "rgb(247, 97, 10)",
         "color_secondary": "#FFDDC1"
     }
     
-    # Run the Taipy Server bound to 0.0.0.0 for external cloud access
     Gui(page=main_page).run(
         title="Kaveri Guest Manager", 
         stylekit=custom_stylekit,
