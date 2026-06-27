@@ -7,6 +7,7 @@ from fpdf import FPDF
 from taipy.gui import Gui, notify, download
 import taipy.gui.builder as tgb
 from supabase import create_client, Client
+import pandas as pd
 
 # ==========================================
 # 1. ACTUAL SUPABASE INITIALIZATION & VALIDATION
@@ -22,7 +23,6 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 else:
     try:
         supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        # Active validation: Ping the table to ensure the schema exists
         supabase.table("guests").select("id").limit(1).execute()
         print("✅ Supabase connection and schema validated successfully.")
         db_status_ui = "🟢 Live Database Connected"
@@ -48,14 +48,17 @@ role_options = ["On-Ground Team 🏃", "Manager 👔"]
 manager_logged_in = False
 pwd_input = ""
 search_incoming = ""
-expected_guests = []
-filtered_expected = []
-mgr_active_guests = []
 session_type = "Morning"
 guest_names_input = ""
 
+# Base DataFrame structure to prevent rendering crashes when tables are empty
+empty_df = pd.DataFrame(columns=["guest_name", "session_type", "lounge", "is_active"])
+expected_guests = empty_df.copy()
+filtered_expected = empty_df.copy()
+mgr_active_guests = empty_df.copy()
+active_guests = empty_df.copy()
+
 # On-Ground Team State
-active_guests = []
 selected_lounge_view = "All"
 lounge_options = ["All", "Unassigned", "L1", "L2", "L3", "BR", "L5"]
 search_active = ""
@@ -64,7 +67,6 @@ search_active = ""
 # 3. CORE LOGIC / REFRESH FUNCTIONS
 # ==========================================
 def refresh_connection(state):
-    """Allows manual retry of database connection without rebooting the server."""
     notify(state, "info", "Checking database connection...")
     global supabase
     if SUPABASE_URL and SUPABASE_KEY:
@@ -87,23 +89,31 @@ def refresh_data(state):
     try:
         # Manager: Incoming Guests
         res_inc = supabase.table("guests").select("*").eq("is_active", False).eq("has_left_kaveri", False).gte("created_at", today_start).order("created_at").execute()
-        state.expected_guests = res_inc.data
+        # Convert explicitly to Pandas DataFrame to prevent UI rendering errors
+        state.expected_guests = pd.DataFrame(res_inc.data) if res_inc.data else empty_df.copy()
         filter_incoming_guests(state)
 
         # Manager & Team: Active Guests
         res_act = supabase.table("guests").select("*").eq("is_active", True).eq("jai_gurudev", False).gte("created_at", today_start).order("created_at").execute()
-        state.mgr_active_guests = res_act.data
-        state.active_guests = res_act.data
+        df_act = pd.DataFrame(res_act.data) if res_act.data else empty_df.copy()
+        state.mgr_active_guests = df_act
+        state.active_guests = df_act
     except Exception as e:
         print(f"Database fetch error: {e}")
         notify(state, "error", "Failed to fetch data from database.")
 
 def filter_incoming_guests(state):
     search = state.search_incoming.lower()
-    if not search:
-        state.filtered_expected = state.expected_guests
+    df = state.expected_guests
+    
+    # Robust Pandas text filtering
+    if not search or df.empty:
+        state.filtered_expected = df
     else:
-        state.filtered_expected = [g for g in state.expected_guests if search in g['guest_name'].lower()]
+        state.filtered_expected = df[df['guest_name'].str.lower().str.contains(search, na=False)]
+
+def on_search_change(state):
+    filter_incoming_guests(state)
 
 # ==========================================
 # 4. CALLBACK FUNCTIONS
@@ -202,8 +212,9 @@ with tgb.Page() as main_page:
             with tgb.part(): tgb.button("Logout", on_action=logout_action)
             
             tgb.text("📥 Incoming Guests", class_name="h3")
-            tgb.input("{search_incoming}", label="🔍 Search Expected Guest...")
+            tgb.input("{search_incoming}", on_change=on_search_change, label="🔍 Search Expected Guest...")
             
+            # Now safely expects Pandas DataFrame
             tgb.table("{filtered_expected}", filter=True, page_size=10)
             
             tgb.html("hr")
