@@ -9,7 +9,7 @@ from supabase import create_client, Client
 import pandas as pd
 
 # ==========================================
-# 1. ACTUAL SUPABASE INITIALIZATION & VALIDATION
+# 1. ACTUAL SUPABASE INITIALIZATION
 # ==========================================
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
@@ -28,12 +28,37 @@ else:
     except Exception as e:
         error_msg = str(e).lower()
         if "relation" in error_msg or "not found" in error_msg:
-            print("⚠️ Database connected, but 'guests' table is missing.")
             db_status_ui = "⚠️ DB Connected, but 'guests' table is missing!"
         else:
-            print(f"⚠️ Failed to initialize Supabase: {e}")
             db_status_ui = "🔴 Database Offline"
         supabase = None
+
+# ==========================================
+# 1B. STRICT DATA MODELS (Fixes UI Blank Name Bug)
+# ==========================================
+class GuestRecord:
+    def __init__(self, id, name, lounge, lmw, demo, ready, guru):
+        self.id = str(id)
+        self.guest_name = str(name)
+        self.lounge = str(lounge)
+        self.lmw_status = str(lmw)
+        self.demo_status = str(demo)
+        self.ready_to_meet_gurudev = bool(ready)
+        self.met_gurudev = bool(guru)
+
+def df_to_records(df):
+    records = []
+    for _, row in df.iterrows():
+        records.append(GuestRecord(
+            id=row.get('id', ''),
+            name=row.get('guest_name', ''),
+            lounge=row.get('lounge', 'Unassigned'),
+            lmw=row.get('lmw_status', 'Not yet'),
+            demo=row.get('demo_status', 'Not yet'),
+            ready=row.get('ready_to_meet_gurudev', False),
+            guru=row.get('met_gurudev', False)
+        ))
+    return records
 
 # ==========================================
 # 2. STATE VARIABLES
@@ -48,13 +73,12 @@ search_incoming = ""
 session_type = "Morning"
 guest_names_input = ""
 
-# DataFrame references
+# DataFrame References
 empty_df = pd.DataFrame(columns=["id", "guest_name", "session_type", "lounge", "is_active", "lmw_status", "demo_status", "ready_to_meet_gurudev", "met_gurudev"])
 expected_guests = empty_df.copy()
-mgr_active_guests = empty_df.copy()
 active_guests = empty_df.copy()
 
-# List Iterators for the new Card UI
+# List Iterators for the Card UI
 expected_guests_list = []
 mgr_active_guests_list = []
 active_guests_list = []
@@ -79,6 +103,10 @@ status_options = ["Not yet", "Done", "Skipped"]
 # ==========================================
 # 3. CORE LOGIC / REFRESH FUNCTIONS
 # ==========================================
+def on_init(state):
+    """Fires instantly when ANYONE opens the app, fetching live data immediately."""
+    refresh_data(state)
+
 def get_today_start():
     return f"{datetime.utcnow().strftime('%Y-%m-%d')}T00:00:00+00:00"
 
@@ -95,26 +123,25 @@ def refresh_connection(state):
             refresh_data(state)
         except Exception as e:
             state.db_status_ui = "🔴 Database Offline or Schema Missing"
-            notify(state, "error", "Could not verify database connection or schema.")
 
 def refresh_data(state):
     if not supabase: return
     today_start = get_today_start()
     
     try:
-        # Incoming (Expected)
+        # Expected / Incoming Fetch
         res_inc = supabase.table("guests").select("*").eq("is_active", False).eq("has_left_kaveri", False).gte("created_at", today_start).order("created_at").execute()
         state.expected_guests = pd.DataFrame(res_inc.data) if res_inc.data else empty_df.copy()
         filter_incoming_guests(state)
 
-        # Active (Arrived)
+        # Active / Arrived Fetch
         res_act = supabase.table("guests").select("*").eq("is_active", True).eq("jai_gurudev", False).gte("created_at", today_start).order("created_at").execute()
         df_act = pd.DataFrame(res_act.data) if res_act.data else empty_df.copy()
-        
-        state.mgr_active_guests = df_act.copy()
-        state.mgr_active_guests_list = df_act.to_dict('records')
-        
         state.active_guests = df_act.copy()
+        
+        # Populate Manager Live Overview
+        state.mgr_active_guests_list = df_to_records(df_act)
+        
         filter_active_guests(state)
     except Exception as e:
         print(f"Database fetch error: {e}")
@@ -123,46 +150,42 @@ def filter_incoming_guests(state):
     search = state.search_incoming.lower()
     df = state.expected_guests.copy() 
     if not search or df.empty:
-        state.expected_guests_list = df.to_dict('records')
+        state.expected_guests_list = df_to_records(df)
     else:
         filtered = df[df['guest_name'].str.lower().str.contains(search, na=False)]
-        state.expected_guests_list = filtered.to_dict('records')
+        state.expected_guests_list = df_to_records(filtered)
 
 def filter_active_guests(state):
     search = state.search_active.lower()
     df = state.active_guests.copy()
     if not search or df.empty:
-        state.active_guests_list = df.to_dict('records')
+        state.active_guests_list = df_to_records(df)
     else:
         filtered = df[df['guest_name'].str.lower().str.contains(search, na=False)]
-        state.active_guests_list = filtered.to_dict('records')
+        state.active_guests_list = df_to_records(filtered)
 
-def on_search_change(state): 
-    filter_incoming_guests(state)
-
-def on_search_active_change(state):
-    filter_active_guests(state)
+def on_search_change(state): filter_incoming_guests(state)
+def on_search_active_change(state): filter_active_guests(state)
 
 # ==========================================
 # 4. THE BRIDGE: MANAGER ACTIVATION
 # ==========================================
 def manager_activate_from_card(state, id, payload):
     if not supabase: return
-    # Find guest by the button's ID
-    guest = next((g for g in state.expected_guests_list if str(g['id']) == str(id)), None)
+    # The 'id' passed here corresponds to the exact guest UUID
+    guest = next((g for g in state.expected_guests_list if g.id == str(id)), None)
     
     if guest:
         try:
             supabase.table("guests").update({
                 "is_active": True, 
                 "lounge": "Unassigned"
-            }).eq("id", str(guest["id"])).execute()
+            }).eq("id", guest.id).execute()
             
-            notify(state, "success", f"✅ {guest['guest_name']} has arrived!")
+            notify(state, "success", f"✅ {guest.guest_name} has arrived!")
             refresh_data(state) 
         except Exception as e:
-            notify(state, "error", f"Failed to activate {guest['guest_name']}.")
-            print(f"Activation error: {e}")
+            notify(state, "error", f"Failed to activate {guest.guest_name}.")
 
 # ==========================================
 # 5. SMART DRAWER & TEAM ACTIONS
@@ -179,23 +202,22 @@ def update_wa_url(state):
     state.wa_url = f"https://wa.me/?text={urllib.parse.quote(msg)}"
 
 def open_drawer_from_card(state, id, payload):
-    # Find guest by the button's ID
-    guest = next((g for g in state.active_guests_list if str(g['id']) == str(id)), None)
+    guest = next((g for g in state.active_guests_list if g.id == str(id)), None)
     if guest:
-        state.selected_guest_id = str(guest["id"])
-        state.selected_guest_name = guest["guest_name"]
-        state.selected_guest_lounge = guest.get("lounge", "Unassigned")
-        state.selected_guest_lmw = guest.get("lmw_status", "Not yet")
-        state.selected_guest_demo = guest.get("demo_status", "Not yet")
-        state.selected_guest_ready = bool(guest.get("ready_to_meet_gurudev", False))
-        state.selected_guest_guru = bool(guest.get("met_gurudev", False))
+        state.selected_guest_id = guest.id
+        state.selected_guest_name = guest.guest_name
+        state.selected_guest_lounge = guest.lounge
+        state.selected_guest_lmw = guest.lmw_status
+        state.selected_guest_demo = guest.demo_status
+        state.selected_guest_ready = guest.ready_to_meet_gurudev
+        state.selected_guest_guru = guest.met_gurudev
         
         update_wa_url(state)
         state.show_drawer = True
 
 def close_drawer(state, id=None, payload=None):
     state.show_drawer = False
-    refresh_data(state) # Quick sync just to guarantee alignment on close
+    refresh_data(state)
 
 def on_drawer_change(state):
     """AUTO-SAVE ENGINE: Triggers instantly on any toggle or dropdown change."""
@@ -203,7 +225,6 @@ def on_drawer_change(state):
     
     if not supabase or not state.selected_guest_id: return
     
-    # Force strong types to prevent "Failed to save" bug
     update_data = {
         "lounge": str(state.selected_guest_lounge),
         "lmw_status": str(state.selected_guest_lmw),
@@ -214,22 +235,8 @@ def on_drawer_change(state):
     
     try:
         supabase.table("guests").update(update_data).eq("id", str(state.selected_guest_id)).execute()
-        
-        # Silently update the local card list so the UI reflects changes instantly behind the drawer
-        guests = state.active_guests_list.copy()
-        for g in guests:
-            if str(g['id']) == str(state.selected_guest_id):
-                g['lounge'] = state.selected_guest_lounge
-                g['lmw_status'] = state.selected_guest_lmw
-                g['demo_status'] = state.selected_guest_demo
-                g['ready_to_meet_gurudev'] = state.selected_guest_ready
-                g['met_gurudev'] = state.selected_guest_guru
-                break
-        state.active_guests_list = guests
-        
     except Exception as e:
         print(f"Auto-save error: {e}")
-        notify(state, "error", "Network blip: Auto-save failed.")
 
 def checkout_guest(state):
     if not supabase: return
@@ -239,7 +246,6 @@ def checkout_guest(state):
         close_drawer(state)
     except Exception as e:
         notify(state, "error", "Failed to checkout guest.")
-        print(f"Checkout error: {e}")
 
 # ==========================================
 # 6. MANAGER GENERIC CALLBACKS
@@ -299,10 +305,10 @@ def generate_pdf_report(state):
 # ==========================================
 with tgb.Page() as main_page:
     
-    # Inject Custom CSS for Beautiful Mobile Cards
+    # Custom CSS for UI Cards
     tgb.html("style", text="""
-        .card-active { border: 2px solid #F7610A; border-radius: 8px; padding: 12px; margin-bottom: 12px; background-color: #fff9f5; box-shadow: 0 2px 5px rgba(0,0,0,0.05); }
-        .card-expected { border: 1px solid #ccc; border-radius: 8px; padding: 12px; margin-bottom: 12px; background-color: #fefefe; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+        .card-active { border: 2px solid #F7610A; border-radius: 8px; padding: 12px; margin-bottom: 12px; background-color: #fff9f5; }
+        .card-expected { border: 1px solid #ccc; border-radius: 8px; padding: 12px; margin-bottom: 12px; background-color: #fefefe; }
         .card-arrived { border: 1px solid #4CAF50; border-radius: 8px; padding: 12px; margin-bottom: 12px; background-color: #f1f8e9; }
         .lounge-tag { color: #F7610A; font-weight: bold; font-size: 0.9em; }
     """)
@@ -335,10 +341,10 @@ with tgb.Page() as main_page:
             tgb.text("📥 Incoming Guests", class_name="h3")
             tgb.input("{search_incoming}", on_change=on_search_change, label="🔍 Search Expected Guest...")
             
-            # --- MANAGER INCOMING CARDS ---
+            # --- MANAGER INCOMING CARDS (Bug Fixed: Names render correctly) ---
             with tgb.part(loop="{expected_guests_list}"):
                 with tgb.part(class_name="card-expected"):
-                    tgb.layout(columns="2 1")
+                    tgb.layout(columns="3 1")
                     with tgb.part():
                         tgb.text("**{__LOOPITEM__.guest_name}**", mode="md")
                         tgb.text("⏳ Expected", mode="md", class_name="text-muted")
@@ -348,7 +354,6 @@ with tgb.Page() as main_page:
             tgb.html("hr")
             tgb.text("🟢 Arrived Guests (Live Overview)", class_name="h3")
             
-            # --- MANAGER ARRIVED CARDS ---
             with tgb.part(loop="{mgr_active_guests_list}"):
                 with tgb.part(class_name="card-arrived"):
                     tgb.text("🟢 **{__LOOPITEM__.guest_name}** | 📍 {__LOOPITEM__.lounge}", mode="md")
@@ -371,17 +376,17 @@ with tgb.Page() as main_page:
         tgb.input("{search_active}", on_change=on_search_active_change, label="🔍 Search Active Guest...")
         tgb.html("br")
         
-        # --- TEAM ACTIVE CARDS ---
+        # --- TEAM ACTIVE CARDS (Highly Compact Layout) ---
         with tgb.part(loop="{active_guests_list}"):
             with tgb.part(class_name="card-active"):
-                tgb.layout(columns="2 1")
+                tgb.layout(columns="3 1")
                 with tgb.part():
                     tgb.text("**{__LOOPITEM__.guest_name}**", mode="md")
                     tgb.text("📍 {__LOOPITEM__.lounge}", mode="md", class_name="lounge-tag")
                 with tgb.part():
                     tgb.button("⚙️ Manage", id="{__LOOPITEM__.id}", on_action=open_drawer_from_card)
         
-        # --- THE SMART DRAWER (AUTO-SAVE ENABLED) ---
+        # --- THE SMART DRAWER (AUTO-SAVE) ---
         with tgb.dialog("{show_drawer}", title="Managing: {selected_guest_name}", on_action=close_drawer):
             tgb.text("Lounge Assignment", class_name="h5")
             tgb.selector(value="{selected_guest_lounge}", lov="{lounge_options}", dropdown=True, on_change=on_drawer_change)
