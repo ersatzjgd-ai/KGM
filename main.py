@@ -9,7 +9,7 @@ from supabase import create_client, Client
 import pandas as pd
 
 # ==========================================
-# 1. ACTUAL SUPABASE INITIALIZATION
+# 1. SUPABASE INITIALIZATION
 # ==========================================
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
@@ -23,18 +23,13 @@ else:
     try:
         supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
         supabase.table("guests").select("id").limit(1).execute()
-        print("✅ Supabase connection and schema validated successfully.")
         db_status_ui = "🟢 Live Database Connected"
     except Exception as e:
-        error_msg = str(e).lower()
-        if "relation" in error_msg or "not found" in error_msg:
-            db_status_ui = "⚠️ DB Connected, but 'guests' table is missing!"
-        else:
-            db_status_ui = "🔴 Database Offline"
+        db_status_ui = "🔴 Database Offline or Missing Schema"
         supabase = None
 
 # ==========================================
-# 1B. STRICT DATA MODELS (Fixes UI Blank Name Bug)
+# 1B. STRICT DATA MODELS (Fixes the Blank Name Bug)
 # ==========================================
 class GuestRecord:
     def __init__(self, id, name, lounge, lmw, demo, ready, guru):
@@ -46,12 +41,18 @@ class GuestRecord:
         self.ready_to_meet_gurudev = bool(ready)
         self.met_gurudev = bool(guru)
 
+# The "Schema Dummy" - Prevents Taipy from crashing on empty lists
+dummy_guest = GuestRecord("dummy", "No guests currently.", "Unassigned", "Not yet", "Not yet", False, False)
+
 def df_to_records(df):
+    if df.empty:
+        return [dummy_guest]
+    
     records = []
     for _, row in df.iterrows():
         records.append(GuestRecord(
             id=row.get('id', ''),
-            name=row.get('guest_name', ''),
+            name=row.get('guest_name', 'Unknown'),
             lounge=row.get('lounge', 'Unassigned'),
             lmw=row.get('lmw_status', 'Not yet'),
             demo=row.get('demo_status', 'Not yet'),
@@ -66,29 +67,25 @@ def df_to_records(df):
 role = "On-Ground Team 🏃"
 role_options = ["On-Ground Team 🏃", "Manager 👔"]
 
-# Manager State
 manager_logged_in = False
 pwd_input = ""
 search_incoming = ""
 session_type = "Morning"
 guest_names_input = ""
 
-# DataFrame References
 empty_df = pd.DataFrame(columns=["id", "guest_name", "session_type", "lounge", "is_active", "lmw_status", "demo_status", "ready_to_meet_gurudev", "met_gurudev"])
 expected_guests = empty_df.copy()
 active_guests = empty_df.copy()
 
-# List Iterators for the Card UI
-expected_guests_list = []
-mgr_active_guests_list = []
-active_guests_list = []
+# Initialize with the dummy so Taipy maps the UI immediately
+expected_guests_list = [dummy_guest]
+mgr_active_guests_list = [dummy_guest]
+active_guests_list = [dummy_guest]
 
-# On-Ground Team State
 selected_lounge_view = "All"
 lounge_options = ["All", "Unassigned", "L1", "L2", "L3", "BR", "L5"]
 search_active = ""
 
-# Smart Drawer (Dialog) State
 show_drawer = False
 selected_guest_id = ""
 selected_guest_name = ""
@@ -104,14 +101,12 @@ status_options = ["Not yet", "Done", "Skipped"]
 # 3. CORE LOGIC / REFRESH FUNCTIONS
 # ==========================================
 def on_init(state):
-    """Fires instantly when ANYONE opens the app, fetching live data immediately."""
     refresh_data(state)
 
 def get_today_start():
     return f"{datetime.utcnow().strftime('%Y-%m-%d')}T00:00:00+00:00"
 
 def refresh_connection(state):
-    notify(state, "info", "Checking database connection...")
     global supabase
     if SUPABASE_URL and SUPABASE_KEY:
         try:
@@ -119,29 +114,24 @@ def refresh_connection(state):
             temp_client.table("guests").select("id").limit(1).execute()
             supabase = temp_client
             state.db_status_ui = "🟢 Live Database Connected"
-            notify(state, "success", "Database reconnected successfully!")
+            notify(state, "success", "Database reconnected!")
             refresh_data(state)
-        except Exception as e:
-            state.db_status_ui = "🔴 Database Offline or Schema Missing"
+        except Exception:
+            state.db_status_ui = "🔴 Database Offline"
 
 def refresh_data(state):
     if not supabase: return
     today_start = get_today_start()
     
     try:
-        # Expected / Incoming Fetch
         res_inc = supabase.table("guests").select("*").eq("is_active", False).eq("has_left_kaveri", False).gte("created_at", today_start).order("created_at").execute()
         state.expected_guests = pd.DataFrame(res_inc.data) if res_inc.data else empty_df.copy()
         filter_incoming_guests(state)
 
-        # Active / Arrived Fetch
         res_act = supabase.table("guests").select("*").eq("is_active", True).eq("jai_gurudev", False).gte("created_at", today_start).order("created_at").execute()
         df_act = pd.DataFrame(res_act.data) if res_act.data else empty_df.copy()
         state.active_guests = df_act.copy()
-        
-        # Populate Manager Live Overview
         state.mgr_active_guests_list = df_to_records(df_act)
-        
         filter_active_guests(state)
     except Exception as e:
         print(f"Database fetch error: {e}")
@@ -168,42 +158,29 @@ def on_search_change(state): filter_incoming_guests(state)
 def on_search_active_change(state): filter_active_guests(state)
 
 # ==========================================
-# 4. THE BRIDGE: MANAGER ACTIVATION
+# 4. MANAGER & DRAWER ACTIONS
 # ==========================================
 def manager_activate_from_card(state, id, payload):
     if not supabase: return
-    # The 'id' passed here corresponds to the exact guest UUID
     guest = next((g for g in state.expected_guests_list if g.id == str(id)), None)
-    
-    if guest:
+    if guest and guest.id != "dummy":
         try:
-            supabase.table("guests").update({
-                "is_active": True, 
-                "lounge": "Unassigned"
-            }).eq("id", guest.id).execute()
-            
+            supabase.table("guests").update({"is_active": True, "lounge": "Unassigned"}).eq("id", guest.id).execute()
             notify(state, "success", f"✅ {guest.guest_name} has arrived!")
             refresh_data(state) 
-        except Exception as e:
+        except Exception:
             notify(state, "error", f"Failed to activate {guest.guest_name}.")
 
-# ==========================================
-# 5. SMART DRAWER & TEAM ACTIONS
-# ==========================================
 def update_wa_url(state):
-    msg = (
-        f"*{state.selected_guest_lounge}*\n"
-        f"{state.selected_guest_name}\n"
-        f"📺 LMW: {state.selected_guest_lmw}\n"
-        f"💻 IP Demo: {state.selected_guest_demo}\n"
-        f"⏳ Ready for Vyas: {'✅' if state.selected_guest_ready else '❌'}\n"
-        f"🤝 Met Gurudev: {'✅' if state.selected_guest_guru else '❌'}"
-    )
+    msg = (f"*{state.selected_guest_lounge}*\n{state.selected_guest_name}\n"
+           f"📺 LMW: {state.selected_guest_lmw}\n💻 IP Demo: {state.selected_guest_demo}\n"
+           f"⏳ Ready for Vyas: {'✅' if state.selected_guest_ready else '❌'}\n"
+           f"🤝 Met Gurudev: {'✅' if state.selected_guest_guru else '❌'}")
     state.wa_url = f"https://wa.me/?text={urllib.parse.quote(msg)}"
 
 def open_drawer_from_card(state, id, payload):
     guest = next((g for g in state.active_guests_list if g.id == str(id)), None)
-    if guest:
+    if guest and guest.id != "dummy":
         state.selected_guest_id = guest.id
         state.selected_guest_name = guest.guest_name
         state.selected_guest_lounge = guest.lounge
@@ -211,7 +188,6 @@ def open_drawer_from_card(state, id, payload):
         state.selected_guest_demo = guest.demo_status
         state.selected_guest_ready = guest.ready_to_meet_gurudev
         state.selected_guest_guru = guest.met_gurudev
-        
         update_wa_url(state)
         state.show_drawer = True
 
@@ -220,9 +196,7 @@ def close_drawer(state, id=None, payload=None):
     refresh_data(state)
 
 def on_drawer_change(state):
-    """AUTO-SAVE ENGINE: Triggers instantly on any toggle or dropdown change."""
     update_wa_url(state)
-    
     if not supabase or not state.selected_guest_id: return
     
     update_data = {
@@ -232,27 +206,25 @@ def on_drawer_change(state):
         "ready_to_meet_gurudev": bool(state.selected_guest_ready),
         "met_gurudev": bool(state.selected_guest_guru)
     }
-    
     try:
         supabase.table("guests").update(update_data).eq("id", str(state.selected_guest_id)).execute()
-    except Exception as e:
-        print(f"Auto-save error: {e}")
+    except Exception:
+        pass
 
 def checkout_guest(state):
     if not supabase: return
     try:
         supabase.table("guests").update({"jai_gurudev": True, "is_active": False}).eq("id", str(state.selected_guest_id)).execute()
-        notify(state, "success", f"{state.selected_guest_name} marked as Jai Gurudev!")
+        notify(state, "success", f"{state.selected_guest_name} checked out!")
         close_drawer(state)
-    except Exception as e:
+    except Exception:
         notify(state, "error", "Failed to checkout guest.")
 
 # ==========================================
-# 6. MANAGER GENERIC CALLBACKS
+# 5. AUTH & EXPORT
 # ==========================================
 def login_action(state):
-    correct_password = os.environ.get("MANAGER_PASSWORD", "kaveri_admin")
-    if state.pwd_input == correct_password: 
+    if state.pwd_input == os.environ.get("MANAGER_PASSWORD", "kaveri_admin"): 
         state.manager_logged_in = True
         refresh_data(state)
         notify(state, "success", "Logged in successfully!") 
@@ -262,30 +234,27 @@ def login_action(state):
 def logout_action(state):
     state.manager_logged_in = False
     state.pwd_input = ""
-    notify(state, "info", "Logged out.")
 
 def save_new_guests(state):
-    if not supabase: return
-    if state.guest_names_input.strip():
-        names_list = [name.strip() for name in state.guest_names_input.split('\n') if name.strip()]
-        insert_data = [{"guest_name": name, "session_type": state.session_type} for name in names_list]
-        try:
-            supabase.table("guests").insert(insert_data).execute()
-            notify(state, "success", f"Added {len(names_list)} guests!")
-            state.guest_names_input = ""
-            refresh_data(state)
-        except Exception as e:
-            notify(state, "error", "Failed to save guests.")
+    if not supabase or not state.guest_names_input.strip(): return
+    names_list = [name.strip() for name in state.guest_names_input.split('\n') if name.strip()]
+    insert_data = [{"guest_name": name, "session_type": state.session_type} for name in names_list]
+    try:
+        supabase.table("guests").insert(insert_data).execute()
+        notify(state, "success", f"Added {len(names_list)} guests!")
+        state.guest_names_input = ""
+        refresh_data(state)
+    except Exception:
+        notify(state, "error", "Failed to save guests.")
 
 def generate_pdf_report(state):
     if not supabase: return
     try:
-        today_start = get_today_start()
-        res = supabase.table("guests").select("*").gte("created_at", today_start).order("created_at").execute()
+        res = supabase.table("guests").select("*").gte("created_at", get_today_start()).order("created_at").execute()
         pdf = FPDF()
         pdf.add_page()
         pdf.set_font("Arial", 'B', 16)
-        pdf.cell(0, 10, txt=f"Kaveri GM - Session Report ({datetime.now().strftime('%Y-%m-%d')})", ln=True, align='C')
+        pdf.cell(0, 10, txt=f"Kaveri GM Report ({datetime.now().strftime('%Y-%m-%d')})", ln=True, align='C')
         pdf.ln(5)
         for g in res.data:
             pdf.set_font("Arial", 'B', 12)
@@ -293,33 +262,31 @@ def generate_pdf_report(state):
             pdf.set_font("Arial", '', 10)
             pdf.cell(0, 6, txt=f"Lounge: {g.get('lounge', 'Unassigned')} | LMW: {g.get('lmw_status', 'Not yet')}", ln=True)
             pdf.ln(2)
-        pdf_file_path = os.path.join(tempfile.gettempdir(), f"Kaveri_Report_{datetime.now().strftime('%Y%m%d')}.pdf")
+        pdf_file_path = os.path.join(tempfile.gettempdir(), f"Report_{datetime.now().strftime('%Y%m%d')}.pdf")
         pdf.output(pdf_file_path)
-        download(state, content=pdf_file_path, name=f"Kaveri_Report_{datetime.now().strftime('%Y%m%d')}.pdf")
-        notify(state, "success", "Report downloaded!")
-    except Exception as e:
+        download(state, content=pdf_file_path, name="Report.pdf")
+    except Exception:
         notify(state, "error", "Failed to generate report.")
 
 # ==========================================
-# 7. GUI LAYOUT
+# 6. GUI LAYOUT
 # ==========================================
 with tgb.Page() as main_page:
     
-    # Custom CSS for UI Cards
     tgb.html("style", text="""
         .card-active { border: 2px solid #F7610A; border-radius: 8px; padding: 12px; margin-bottom: 12px; background-color: #fff9f5; }
         .card-expected { border: 1px solid #ccc; border-radius: 8px; padding: 12px; margin-bottom: 12px; background-color: #fefefe; }
         .card-arrived { border: 1px solid #4CAF50; border-radius: 8px; padding: 12px; margin-bottom: 12px; background-color: #f1f8e9; }
         .lounge-tag { color: #F7610A; font-weight: bold; font-size: 0.9em; }
+        .dummy-text { font-style: italic; color: #888; }
     """)
 
-    # Header & Status Indicator
     tgb.layout(columns="1 1")
     with tgb.part():
         tgb.text("🏛️ Kaveri GM", class_name="h1")
     with tgb.part():
         tgb.text("{db_status_ui}", class_name="h4")
-        tgb.button("🔄 Retry Connection", on_action=refresh_connection)
+        tgb.button("🔄 Retry", on_action=refresh_connection)
     
     tgb.selector(value="{role}", lov="{role_options}", dropdown=False)
     tgb.html("hr")
@@ -341,32 +308,36 @@ with tgb.Page() as main_page:
             tgb.text("📥 Incoming Guests", class_name="h3")
             tgb.input("{search_incoming}", on_change=on_search_change, label="🔍 Search Expected Guest...")
             
-            # --- MANAGER INCOMING CARDS (Bug Fixed: Names render correctly) ---
             with tgb.part(loop="{expected_guests_list}"):
-                with tgb.part(class_name="card-expected"):
+                # Actual Guest Card
+                with tgb.part(class_name="card-expected", render="{__LOOPITEM__.id != 'dummy'}"):
                     tgb.layout(columns="3 1")
                     with tgb.part():
                         tgb.text("**{__LOOPITEM__.guest_name}**", mode="md")
-                        tgb.text("⏳ Expected", mode="md", class_name="text-muted")
                     with tgb.part():
                         tgb.button("✅ Arrived", id="{__LOOPITEM__.id}", on_action=manager_activate_from_card)
+                # Dummy Card
+                with tgb.part(render="{__LOOPITEM__.id == 'dummy'}"):
+                    tgb.text("{__LOOPITEM__.guest_name}", class_name="dummy-text")
             
             tgb.html("hr")
             tgb.text("🟢 Arrived Guests (Live Overview)", class_name="h3")
             
             with tgb.part(loop="{mgr_active_guests_list}"):
-                with tgb.part(class_name="card-arrived"):
+                with tgb.part(class_name="card-arrived", render="{__LOOPITEM__.id != 'dummy'}"):
                     tgb.text("🟢 **{__LOOPITEM__.guest_name}** | 📍 {__LOOPITEM__.lounge}", mode="md")
+                with tgb.part(render="{__LOOPITEM__.id == 'dummy'}"):
+                    tgb.text("{__LOOPITEM__.guest_name}", class_name="dummy-text")
             
             tgb.html("hr")
             with tgb.expandable(title="➕ Add New Expected Guests"):
                 tgb.selector(value="{session_type}", lov=["Morning", "Evening"], dropdown=False)
                 tgb.input("{guest_names_input}", multiline=True, label="Guest Names (One per line)")
-                tgb.button("💾 Save to Database", on_action=save_new_guests)
+                tgb.button("💾 Save", on_action=save_new_guests)
 
             tgb.html("hr")
             with tgb.expandable(title="📊 View End of Session Report"):
-                tgb.button("📥 Download Report as PDF", on_action=generate_pdf_report, class_name="primary")
+                tgb.button("📥 Download PDF", on_action=generate_pdf_report, class_name="primary")
 
     # ------------------------------------------
     # ON-GROUND TEAM VIEW
@@ -376,17 +347,17 @@ with tgb.Page() as main_page:
         tgb.input("{search_active}", on_change=on_search_active_change, label="🔍 Search Active Guest...")
         tgb.html("br")
         
-        # --- TEAM ACTIVE CARDS (Highly Compact Layout) ---
         with tgb.part(loop="{active_guests_list}"):
-            with tgb.part(class_name="card-active"):
+            with tgb.part(class_name="card-active", render="{__LOOPITEM__.id != 'dummy'}"):
                 tgb.layout(columns="3 1")
                 with tgb.part():
                     tgb.text("**{__LOOPITEM__.guest_name}**", mode="md")
                     tgb.text("📍 {__LOOPITEM__.lounge}", mode="md", class_name="lounge-tag")
                 with tgb.part():
                     tgb.button("⚙️ Manage", id="{__LOOPITEM__.id}", on_action=open_drawer_from_card)
+            with tgb.part(render="{__LOOPITEM__.id == 'dummy'}"):
+                tgb.text("{__LOOPITEM__.guest_name}", class_name="dummy-text")
         
-        # --- THE SMART DRAWER (AUTO-SAVE) ---
         with tgb.dialog("{show_drawer}", title="Managing: {selected_guest_name}", on_action=close_drawer):
             tgb.text("Lounge Assignment", class_name="h5")
             tgb.selector(value="{selected_guest_lounge}", lov="{lounge_options}", dropdown=True, on_change=on_drawer_change)
@@ -410,21 +381,6 @@ with tgb.Page() as main_page:
             tgb.html("br")
             tgb.button("🔴 Checkout (Jai Gurudev)", on_action=checkout_guest, class_name="fullwidth")
 
-# ==========================================
-# 7. INITIALIZATION & RAILWAY CONFIG
-# ==========================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    
-    custom_stylekit = {
-        "color_primary": "rgb(247, 97, 10)",
-        "color_secondary": "#FFDDC1"
-    }
-    
-    Gui(page=main_page).run(
-        title="Kaveri Guest Manager", 
-        stylekit=custom_stylekit,
-        host="0.0.0.0", 
-        port=port,
-        dark_mode=False
-    )
+    Gui(page=main_page).run(title="Kaveri GM", stylekit={"color_primary": "rgb(247, 97, 10)", "color_secondary": "#FFDDC1"}, host="0.0.0.0", port=port, dark_mode=False)
