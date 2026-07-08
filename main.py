@@ -48,7 +48,7 @@ search_incoming = ""
 session_type = "Morning"
 guest_names_input = ""
 
-# Base DataFrame structure to prevent rendering crashes when tables are empty
+# Base DataFrame structure
 empty_df = pd.DataFrame(columns=["id", "guest_name", "session_type", "lounge", "is_active", "lmw_status", "demo_status", "ready_to_meet_gurudev", "met_gurudev"])
 expected_guests = empty_df.copy()
 filtered_expected = empty_df.copy()
@@ -76,7 +76,6 @@ status_options = ["Not yet", "Done", "Skipped"]
 # 3. CORE LOGIC / REFRESH FUNCTIONS
 # ==========================================
 def get_today_start():
-    """Dynamically calculates midnight UTC to match Supabase timestamps exactly."""
     return f"{datetime.utcnow().strftime('%Y-%m-%d')}T00:00:00+00:00"
 
 def refresh_connection(state):
@@ -108,7 +107,6 @@ def refresh_data(state):
         res_act = supabase.table("guests").select("*").eq("is_active", True).eq("jai_gurudev", False).gte("created_at", today_start).order("created_at").execute()
         df_act = pd.DataFrame(res_act.data) if res_act.data else empty_df.copy()
         
-        # Explicit copies force the UI tables to redraw
         state.mgr_active_guests = df_act.copy()
         state.active_guests = df_act.copy()
     except Exception as e:
@@ -130,7 +128,6 @@ def on_search_change(state):
 # 4. THE BRIDGE: MANAGER ACTIVATION
 # ==========================================
 def manager_activate_guest(state, id, payload):
-    """Triggered when the Manager taps a guest in the 'Incoming Guests' table."""
     if not supabase: return
     
     row_index = payload.get("index")
@@ -140,14 +137,13 @@ def manager_activate_guest(state, id, payload):
         guest_name = guest["guest_name"]
         
         try:
-            # Activate guest and default lounge to 'Unassigned'
             supabase.table("guests").update({
                 "is_active": True, 
                 "lounge": "Unassigned"
             }).eq("id", guest_id).execute()
             
             notify(state, "success", f"✅ {guest_name} has arrived!")
-            refresh_data(state) # Instantly triggers the move to the active dashboard
+            refresh_data(state) 
         except Exception as e:
             notify(state, "error", f"Failed to activate {guest_name}.")
             print(f"Activation error: {e}")
@@ -181,6 +177,10 @@ def open_drawer(state, id, payload):
         update_wa_url(state)
         state.show_drawer = True
 
+def close_drawer(state, id=None, payload=None):
+    """Explicit override to guarantee the drawer closes when X is clicked."""
+    state.show_drawer = False
+
 def on_drawer_change(state):
     update_wa_url(state)
 
@@ -196,7 +196,7 @@ def save_drawer_updates(state):
     try:
         supabase.table("guests").update(update_data).eq("id", state.selected_guest_id).execute()
         notify(state, "success", f"Saved updates for {state.selected_guest_name}")
-        state.show_drawer = False
+        close_drawer(state)
         refresh_data(state)
     except Exception as e:
         notify(state, "error", "Failed to save updates.")
@@ -206,7 +206,7 @@ def checkout_guest(state):
     try:
         supabase.table("guests").update({"jai_gurudev": True, "is_active": False}).eq("id", state.selected_guest_id).execute()
         notify(state, "success", f"{state.selected_guest_name} marked as Jai Gurudev!")
-        state.show_drawer = False
+        close_drawer(state)
         refresh_data(state)
     except Exception as e:
         notify(state, "error", "Failed to checkout guest.")
@@ -297,12 +297,14 @@ with tgb.Page() as main_page:
             tgb.input("{search_incoming}", on_change=on_search_change, label="🔍 Search Expected Guest...")
             tgb.text("Tap a guest's row below to mark them as 'Arrived' and send them to the team. 👇", class_name="text-muted")
             
-            # Interactive Action: Triggers manager_activate_guest when row is clicked
-            tgb.table("{filtered_expected}", on_action=manager_activate_guest, filter=True, page_size=10)
+            # Explicitly locked to only show guest_name
+            tgb.table("{filtered_expected}", columns=["guest_name"], on_action=manager_activate_guest, filter=True, page_size=10)
             
             tgb.html("hr")
             tgb.text("🟢 Arrived Guests (Live Overview)", class_name="h3")
-            tgb.table("{mgr_active_guests}", filter=True, page_size=10) 
+            
+            # Explicitly locked to only show guest_name
+            tgb.table("{mgr_active_guests}", columns=["guest_name"], filter=True, page_size=10) 
             
             tgb.html("hr")
             with tgb.expandable(title="➕ Add New Expected Guests"):
@@ -321,18 +323,24 @@ with tgb.Page() as main_page:
         tgb.text("🏃 Active Team Dashboard", class_name="h2")
         tgb.text("Tap any guest card below to open controls.", class_name="text-muted")
         
-        # Interactive Table: Triggers open_drawer when any row is clicked
-        tgb.table("{active_guests}", on_action=open_drawer, filter=True, page_size=15)
+        # Explicitly locked to only show guest_name
+        tgb.table("{active_guests}", columns=["guest_name"], on_action=open_drawer, filter=True, page_size=15)
         
         # --- THE SMART DRAWER (DIALOG) ---
-        with tgb.dialog("{show_drawer}", title="Managing: {selected_guest_name}"):
-            tgb.text("Lounge Assignment", class_name="h4")
+        # Added explicit on_action to catch the "X" close button and force it shut
+        with tgb.dialog("{show_drawer}", title="Managing: {selected_guest_name}", on_action=close_drawer):
+            tgb.text("Lounge Assignment", class_name="h5")
             tgb.selector(value="{selected_guest_lounge}", lov="{lounge_options}", dropdown=True, on_change=on_drawer_change)
             
-            tgb.html("br")
-            tgb.text("Journey Status", class_name="h4")
-            tgb.selector(value="{selected_guest_lmw}", lov="{status_options}", label="📺 LMW Status", dropdown=False, on_change=on_drawer_change)
-            tgb.selector(value="{selected_guest_demo}", lov="{status_options}", label="💻 IP Demo Status", dropdown=False, on_change=on_drawer_change)
+            tgb.html("hr")
+            tgb.text("Journey Status", class_name="h5")
+            
+            # UPGRADE: Transformed bulky dropdowns into sleek horizontal Pill Buttons
+            tgb.text("📺 LMW Status", class_name="text-muted")
+            tgb.toggle(value="{selected_guest_lmw}", lov="{status_options}", on_change=on_drawer_change)
+            
+            tgb.text("💻 IP Demo Status", class_name="text-muted")
+            tgb.toggle(value="{selected_guest_demo}", lov="{status_options}", on_change=on_drawer_change)
             
             tgb.html("br")
             tgb.toggle(value="{selected_guest_ready}", label="⏳ Ready for Vyas / Gurudev", on_change=on_drawer_change)
