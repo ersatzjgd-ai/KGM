@@ -99,12 +99,12 @@ def refresh_data(state):
     today_start = get_today_start()
     
     try:
-        # Incoming
+        # Incoming (Expected)
         res_inc = supabase.table("guests").select("*").eq("is_active", False).eq("has_left_kaveri", False).gte("created_at", today_start).order("created_at").execute()
         state.expected_guests = pd.DataFrame(res_inc.data) if res_inc.data else empty_df.copy()
         filter_incoming_guests(state)
 
-        # Active
+        # Active (Arrived)
         res_act = supabase.table("guests").select("*").eq("is_active", True).eq("jai_gurudev", False).gte("created_at", today_start).order("created_at").execute()
         df_act = pd.DataFrame(res_act.data) if res_act.data else empty_df.copy()
         
@@ -116,7 +116,6 @@ def refresh_data(state):
 
 def filter_incoming_guests(state):
     search = state.search_incoming.lower()
-    # Explicit copy forces the UI table to detect a state change and redraw
     df = state.expected_guests.copy() 
     
     if not search or df.empty:
@@ -128,7 +127,33 @@ def on_search_change(state):
     filter_incoming_guests(state)
 
 # ==========================================
-# 4. SMART DRAWER & TEAM ACTIONS
+# 4. THE BRIDGE: MANAGER ACTIVATION
+# ==========================================
+def manager_activate_guest(state, id, payload):
+    """Triggered when the Manager taps a guest in the 'Incoming Guests' table."""
+    if not supabase: return
+    
+    row_index = payload.get("index")
+    if row_index is not None and not state.filtered_expected.empty:
+        guest = state.filtered_expected.iloc[row_index]
+        guest_id = guest["id"]
+        guest_name = guest["guest_name"]
+        
+        try:
+            # Activate guest and default lounge to 'Unassigned'
+            supabase.table("guests").update({
+                "is_active": True, 
+                "lounge": "Unassigned"
+            }).eq("id", guest_id).execute()
+            
+            notify(state, "success", f"✅ {guest_name} has arrived!")
+            refresh_data(state) # Instantly triggers the move to the active dashboard
+        except Exception as e:
+            notify(state, "error", f"Failed to activate {guest_name}.")
+            print(f"Activation error: {e}")
+
+# ==========================================
+# 5. SMART DRAWER & TEAM ACTIONS
 # ==========================================
 def update_wa_url(state):
     msg = (
@@ -187,7 +212,7 @@ def checkout_guest(state):
         notify(state, "error", "Failed to checkout guest.")
 
 # ==========================================
-# 5. MANAGER CALLBACK FUNCTIONS
+# 6. MANAGER GENERIC CALLBACKS
 # ==========================================
 def login_action(state):
     correct_password = os.environ.get("MANAGER_PASSWORD", "kaveri_admin")
@@ -212,7 +237,6 @@ def save_new_guests(state):
             supabase.table("guests").insert(insert_data).execute()
             notify(state, "success", f"Added {len(names_list)} guests!")
             state.guest_names_input = ""
-            # Triggers dynamic data refresh and UI redraw
             refresh_data(state)
         except Exception as e:
             notify(state, "error", "Failed to save guests.")
@@ -241,7 +265,7 @@ def generate_pdf_report(state):
         notify(state, "error", "Failed to generate report.")
 
 # ==========================================
-# 6. GUI LAYOUT
+# 7. GUI LAYOUT
 # ==========================================
 with tgb.Page() as main_page:
     # Header & Status Indicator
@@ -271,10 +295,13 @@ with tgb.Page() as main_page:
             
             tgb.text("📥 Incoming Guests", class_name="h3")
             tgb.input("{search_incoming}", on_change=on_search_change, label="🔍 Search Expected Guest...")
-            tgb.table("{filtered_expected}", filter=True, page_size=10)
+            tgb.text("Tap a guest's row below to mark them as 'Arrived' and send them to the team. 👇", class_name="text-muted")
+            
+            # Interactive Action: Triggers manager_activate_guest when row is clicked
+            tgb.table("{filtered_expected}", on_action=manager_activate_guest, filter=True, page_size=10)
             
             tgb.html("hr")
-            tgb.text("🟢 Arrived Guests", class_name="h3")
+            tgb.text("🟢 Arrived Guests (Live Overview)", class_name="h3")
             tgb.table("{mgr_active_guests}", filter=True, page_size=10) 
             
             tgb.html("hr")
